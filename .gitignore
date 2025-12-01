@@ -1,0 +1,61 @@
+# WordPress
+wp-config.php
+wp-content/uploads/
+wp-content/upgrade/
+wp-content/backup-db/
+wp-content/advanced-cache.php
+wp-content/wp-cache-config.php
+wp-content/cache/
+wp-content/cache/supercache/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build files
+*.zip
+*.tar.gz
+dist/
+build/
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# SFTP config (contains sensitive data)
+.vscode/sftp.json
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Composer
+vendor/
+composer.lock
+
+# Sass
+.sass-cache/
+*.css.map
+style.css.map
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
