@@ -114,11 +114,26 @@ class TCM_Telegram {
                     error_log('TCM: Processing name input for registration: ' . $text);
                 }
                 
-                // Удаляем состояние ожидания
+                // Сохраняем имя во временное хранилище
+                update_option('tcm_temp_name_' . $user_id_telegram, $text);
+                
+                // Удаляем состояние ожидания имени
                 delete_option('tcm_waiting_name_' . $user_id_telegram);
                 
-                // Регистрируем пользователя с введенным именем
-                return $this->handle_register($chat_id, $user_id_telegram, $text, $from);
+                // Устанавливаем состояние ожидания выбора проблем
+                update_option('tcm_waiting_problems_' . $user_id_telegram, true);
+                
+                // Показываем вопрос про проблемы с кнопками
+                $this->show_problems_question($chat_id, $user_id_telegram);
+                
+                return true;
+            }
+            
+            // Проверяем, ожидает ли пользователь выбора проблем
+            $waiting_problems = get_option('tcm_waiting_problems_' . $user_id_telegram, false);
+            if ($waiting_problems) {
+                // Пользователь уже выбрал проблемы через кнопки, пропускаем
+                return true;
             }
             
             // Показываем инструкцию для регистрации
@@ -205,27 +220,16 @@ class TCM_Telegram {
             $post_url = home_url('/?p=' . $post_id);
         }
         
+        // Отправляем текст записи
+        $this->send_reply_with_reply_keyboard($chat_id, $text, $this->get_main_reply_keyboard());
+        
         // Отправляем подтверждение со ссылкой (с прилипающей клавиатурой)
         $message = "✅ <b>Запись успешно создана!</b>\n\n" .
                    "🔗 <a href=\"" . esc_url($post_url) . "\">Открыть запись на сайте</a>";
         
-        // Добавляем кнопку редактирования
-        $keyboard = array(
-            array(
-                array('text' => '✏️ Редактировать запись', 'callback_data' => 'edit_post:' . $post_id)
-            )
-        );
-        
         $this->send_reply_with_reply_keyboard($chat_id, $message, $this->get_main_reply_keyboard());
-        $this->send_reply_with_keyboard($chat_id, '', $keyboard);
         
-        // Небольшая задержка перед показом вопроса (чтобы сообщение о создании записи успело отправиться)
-        usleep(300000); // 0.3 секунды
-        
-        // Показываем заполнение одного поля анкеты после отправки записи
-        $this->show_one_questionnaire_question_after_post($chat_id, $user_id_telegram, $user->ID);
-        
-        // Предлагаем перейти в следующую точку (если текущая категория - точка)
+        // Предлагаем перейти в следующую точку (если текущая категория - точка) и показываем вопрос анкеты после точки
         $current_category = get_category($category_id);
         if ($current_category) {
             // Определяем уровень категории
@@ -239,10 +243,13 @@ class TCM_Telegram {
                 }
             }
             
-            // Если это точка (уровень 2), предлагаем следующую точку
+            // Если это точка (уровень 2), показываем вопрос анкеты
             if ($level == 2) {
-                usleep(500000); // Небольшая задержка перед предложением
-                $this->offer_next_point($chat_id, $user_id_telegram, $category_id);
+                // Небольшая задержка перед показом вопроса (чтобы сообщение о создании записи успело отправиться)
+                usleep(300000); // 0.3 секунды
+                
+                // Показываем заполнение одного поля анкеты после отправки точки
+                $this->show_one_questionnaire_question_after_post($chat_id, $user_id_telegram, $user->ID);
             }
         }
         
@@ -277,8 +284,12 @@ class TCM_Telegram {
                 // Проверяем регистрацию
                 $user = $this->users->get_user_by_telegram_id($user_id_telegram);
                 if (!$user) {
-                    // Пользователь не зарегистрирован - показываем приглашение на регистрацию
-                    $this->show_registration_instruction($chat_id);
+                    // Пользователь не зарегистрирован - показываем короткое приветствие и запрашиваем имя
+                    update_option('tcm_waiting_name_' . $user_id_telegram, true);
+                    $this->send_reply($chat_id, 
+                        "👋 <b>Добро пожаловать!</b>\n\n" .
+                        "📝 Пожалуйста, введите ваше имя:"
+                    );
                     return true;
                 }
                 // Пользователь зарегистрирован - показываем главное меню с прилипающей клавиатурой
@@ -428,9 +439,8 @@ class TCM_Telegram {
             update_option('tcm_waiting_name_' . $user_id_telegram, true);
             
             $this->send_reply($chat_id, 
-                "👋 <b>Регистрация</b>\n\n" .
-                "Для регистрации мне нужно ваше имя.\n\n" .
-                "📝 Пожалуйста, отправьте ваше имя (например: Иван Иванов)"
+                "👋 <b>Добро пожаловать!</b>\n\n" .
+                "📝 Пожалуйста, введите ваше имя:"
             );
             return true;
         }
@@ -485,6 +495,257 @@ class TCM_Telegram {
             "В разделе «⚙️ Настройки» вы можете изменить выбранную категорию и другие параметры.\n\n" .
             "💡 <b>Совет:</b> Начните с выбора Шага через меню, затем отправляйте свои записи боту.\n\n" .
             "Желаем успехов в работе! 🚀";
+        
+        $this->send_reply($chat_id, $welcome_message);
+        
+        return true;
+    }
+    
+    /**
+     * Показ вопроса про проблемы
+     */
+    private function show_problems_question($chat_id, $user_id_telegram) {
+        $text = "📋 <b>Обозначьте свою проблему</b>\n\n";
+        $text .= "Выберите одну или несколько проблем, которые вас беспокоят:";
+        
+        // Получаем уже выбранные проблемы
+        $selected_problems = get_option('tcm_temp_problems_' . $user_id_telegram, array());
+        if (!is_array($selected_problems)) {
+            $selected_problems = array();
+        }
+        
+        // Определяем проблемы
+        $problems = array(
+            'drugs' => 'Наркотики',
+            'alcohol' => 'Алкоголь',
+            'gambling' => 'Игромания',
+            'depression' => 'Депрессия',
+            'family_conflicts' => 'Конфликты в семье',
+            'work_conflicts' => 'Конфликты на работе'
+        );
+        
+        // Создаем кнопки (по 2 в ряд)
+        $keyboard = array();
+        $row = array();
+        $button_count = 0;
+        
+        foreach ($problems as $key => $label) {
+            $is_selected = in_array($key, $selected_problems);
+            $button_text = ($is_selected ? '✅ ' : '') . $label;
+            
+            $row[] = array(
+                'text' => $button_text,
+                'callback_data' => 'registration:select_problem:' . $key
+            );
+            
+            $button_count++;
+            if ($button_count % 2 == 0) {
+                $keyboard[] = $row;
+                $row = array();
+            }
+        }
+        
+        // Добавляем последний ряд, если он не пустой
+        if (!empty($row)) {
+            $keyboard[] = $row;
+        }
+        
+        // Кнопка "Готово" если выбрана хотя бы одна проблема
+        if (!empty($selected_problems)) {
+            $keyboard[] = array(
+                array('text' => '✅ Готово', 'callback_data' => 'registration:finish_problems')
+            );
+        }
+        
+        $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
+    }
+    
+    /**
+     * Обработка выбора проблемы
+     */
+    private function handle_problem_selection($chat_id, $problem_key, $user_id_telegram, $callback_id = '') {
+        $log_enabled = defined('WP_DEBUG') && WP_DEBUG;
+        
+        // Получаем message_id из callback_query для обновления сообщения
+        global $tcm_current_callback_query;
+        $message_id = isset($tcm_current_callback_query) && isset($tcm_current_callback_query['message']['message_id']) ? $tcm_current_callback_query['message']['message_id'] : 0;
+        
+        // Получаем уже выбранные проблемы
+        $selected_problems = get_option('tcm_temp_problems_' . $user_id_telegram, array());
+        if (!is_array($selected_problems)) {
+            $selected_problems = array();
+        }
+        
+        // Переключаем выбор проблемы
+        if (in_array($problem_key, $selected_problems)) {
+            // Убираем из выбранных
+            $selected_problems = array_values(array_diff($selected_problems, array($problem_key)));
+        } else {
+            // Добавляем к выбранным
+            $selected_problems[] = $problem_key;
+        }
+        
+        // Сохраняем обновленный список
+        update_option('tcm_temp_problems_' . $user_id_telegram, $selected_problems);
+        
+        // Обновляем сообщение с новыми кнопками
+        $text = "📋 <b>Обозначьте свою проблему</b>\n\n";
+        $text .= "Выберите одну или несколько проблем, которые вас беспокоят:";
+        
+        // Определяем проблемы
+        $problems = array(
+            'drugs' => 'Наркотики',
+            'alcohol' => 'Алкоголь',
+            'gambling' => 'Игромания',
+            'depression' => 'Депрессия',
+            'family_conflicts' => 'Конфликты в семье',
+            'work_conflicts' => 'Конфликты на работе'
+        );
+        
+        // Создаем кнопки (по 2 в ряд)
+        $keyboard = array();
+        $row = array();
+        $button_count = 0;
+        
+        foreach ($problems as $key => $label) {
+            $is_selected = in_array($key, $selected_problems);
+            $button_text = ($is_selected ? '✅ ' : '') . $label;
+            
+            $row[] = array(
+                'text' => $button_text,
+                'callback_data' => 'registration:select_problem:' . $key
+            );
+            
+            $button_count++;
+            if ($button_count % 2 == 0) {
+                $keyboard[] = $row;
+                $row = array();
+            }
+        }
+        
+        // Добавляем последний ряд, если он не пустой
+        if (!empty($row)) {
+            $keyboard[] = $row;
+        }
+        
+        // Кнопка "Готово" если выбрана хотя бы одна проблема
+        if (!empty($selected_problems)) {
+            $keyboard[] = array(
+                array('text' => '✅ Готово', 'callback_data' => 'registration:finish_problems')
+            );
+        }
+        
+        // Обновляем сообщение, если есть message_id
+        if ($message_id > 0) {
+            $this->edit_message_with_keyboard($chat_id, $message_id, $text, $keyboard);
+        } else {
+            // Если нет message_id, отправляем новое сообщение
+            $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
+        }
+        
+        return true;
+    }
+    
+    /**
+     * Обновление сообщения с inline клавиатурой
+     */
+    private function edit_message_with_keyboard($chat_id, $message_id, $text, $keyboard) {
+        $log_enabled = defined('WP_DEBUG') && WP_DEBUG;
+        $token = get_option('tcm_telegram_token', '');
+        
+        if (empty($token)) {
+            return false;
+        }
+        
+        $url = "https://api.telegram.org/bot{$token}/editMessageText";
+        
+        $reply_markup = json_encode(array(
+            'inline_keyboard' => $keyboard
+        ));
+        
+        $body = array(
+            'chat_id' => $chat_id,
+            'message_id' => $message_id,
+            'text' => $text,
+            'parse_mode' => 'HTML',
+            'reply_markup' => $reply_markup
+        );
+        
+        $args = array(
+            'body' => $body,
+            'timeout' => 30
+        );
+        
+        $response = wp_remote_post($url, $args);
+        
+        if ($log_enabled) {
+            if (is_wp_error($response)) {
+                error_log('TCM: edit_message_with_keyboard error: ' . $response->get_error_message());
+            } else {
+                error_log('TCM: edit_message_with_keyboard success');
+            }
+        }
+        
+        return $response;
+    }
+    
+    /**
+     * Завершение регистрации с проблемами
+     */
+    private function finish_registration_with_problems($chat_id, $user_id_telegram, $from = array()) {
+        $log_enabled = defined('WP_DEBUG') && WP_DEBUG;
+        
+        // Получаем сохраненное имя
+        $display_name = get_option('tcm_temp_name_' . $user_id_telegram, '');
+        if (empty($display_name)) {
+            $this->send_reply($chat_id, '❌ Ошибка: имя не найдено. Пожалуйста, начните заново с /start');
+            return false;
+        }
+        
+        // Получаем выбранные проблемы
+        $selected_problems = get_option('tcm_temp_problems_' . $user_id_telegram, array());
+        if (!is_array($selected_problems)) {
+            $selected_problems = array();
+        }
+        
+        // Создаем пользователя
+        $user = $this->users->create_user_from_telegram($user_id_telegram, $display_name, $from);
+        
+        if (is_wp_error($user)) {
+            if ($log_enabled) {
+                error_log('TCM: User creation error: ' . $user->get_error_message());
+            }
+            $this->send_reply($chat_id, 
+                "❌ Ошибка при регистрации: " . $user->get_error_message()
+            );
+            return $user;
+        }
+        
+        if ($log_enabled) {
+            error_log('TCM: User created successfully. ID: ' . $user->ID);
+        }
+        
+        // Сохраняем выбранные проблемы в user_meta
+        if (!empty($selected_problems)) {
+            update_user_meta($user->ID, 'tcm_user_problems', $selected_problems);
+        }
+        
+        // Очищаем временные данные
+        delete_option('tcm_temp_name_' . $user_id_telegram);
+        delete_option('tcm_temp_problems_' . $user_id_telegram);
+        delete_option('tcm_waiting_problems_' . $user_id_telegram);
+        
+        // Сохраняем chat_id пользователя для напоминаний
+        update_user_meta($user->ID, 'tcm_telegram_chat_id', $chat_id);
+        
+        // Показываем главное меню с прилипающей клавиатурой
+        $this->show_main_menu_with_reply_keyboard($chat_id);
+        
+        // Короткое приветственное сообщение
+        $welcome_message = 
+            "👋 <b>Добро пожаловать, " . esc_html($display_name) . "!</b>\n\n" .
+            "✅ Регистрация завершена.\n\n" .
+            "Теперь вы можете выбирать категории и создавать записи.";
         
         $this->send_reply($chat_id, $welcome_message);
         
@@ -1067,8 +1328,36 @@ class TCM_Telegram {
         $callback_id = $callback_query['id'];
         $user_id_telegram = (string)$callback_query['from']['id'];
         
+        // Сохраняем callback_query в глобальной переменной для доступа в других функциях
+        global $tcm_current_callback_query;
+        $tcm_current_callback_query = $callback_query;
+        
         if ($log_enabled) {
             error_log('TCM: Callback query received. Chat ID: ' . $chat_id . ', User ID: ' . $user_id_telegram . ', Data: ' . $data);
+        }
+        
+        // Проверяем, не является ли это callback для регистрации (выбор проблем)
+        $parts = explode(':', $data, 2);
+        $action = $parts[0];
+        $param = isset($parts[1]) ? $parts[1] : '';
+        
+        if ($action == 'registration') {
+            // Для регистрации не проверяем существование пользователя
+            // Подтверждаем получение callback
+            $this->answer_callback_query($callback_id);
+            
+            // Обрабатываем регистрацию
+            $registration_parts = explode(':', $param, 2);
+            $registration_action = isset($registration_parts[0]) ? $registration_parts[0] : '';
+            $registration_param = isset($registration_parts[1]) ? $registration_parts[1] : '';
+            
+            if ($registration_action == 'select_problem') {
+                return $this->handle_problem_selection($chat_id, $registration_param, $user_id_telegram, $callback_id);
+            } elseif ($registration_action == 'finish_problems') {
+                $from = isset($callback_query['from']) ? $callback_query['from'] : array();
+                return $this->finish_registration_with_problems($chat_id, $user_id_telegram, $from);
+            }
+            return false;
         }
         
         // Подтверждаем получение callback
@@ -1096,7 +1385,7 @@ class TCM_Telegram {
         
         switch ($action) {
             case 'menu':
-                return $this->show_main_menu($chat_id);
+                return $this->show_main_menu_with_user($chat_id, $user_id_telegram);
                 
             case 'category':
                 return $this->show_category_selection($chat_id, $param, $user_id_telegram);
@@ -1228,27 +1517,25 @@ class TCM_Telegram {
                 $this->answer_callback_query($callback_query['id'], '✅ Переход в следующую точку выполнен');
                 return true;
             
-            case 'stay_at_point':
-                // Остаться в текущей точке
+            case 'copy_point_name':
+                // Копирование названия точки
                 $point_id = intval($param);
                 $point = get_category($point_id);
                 if ($point) {
-                    $message = "✅ <b>Вы остаетесь в текущей точке</b>\n\n" .
-                              "Текущая точка: <b>" . esc_html($point->name) . "</b>\n\n" .
-                              "💡 <i>Вы можете в любое время оставить запись для этой точки, просто отправьте сообщение боту.</i>";
-                    
-                    $keyboard = array(
-                        array(
-                            array('text' => '📝 Оставить запись для текущей точки', 'callback_data' => 'stay_at_point:' . $point_id)
-                        ),
-                        array(
-                            array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
-                        )
-                    );
-                    
-                    $this->send_reply_with_keyboard($chat_id, $message, $keyboard);
+                    // Проверяем настройку вывода промта
+                    $show_prompt = get_option('tcm_show_prompt', true);
+                    if ($show_prompt) {
+                        // Выводим промт для точки отдельным сообщением для копирования
+                        $prompt_text = $this->build_point_prompt($point_id, $user_id_telegram);
+                        if (empty($prompt_text)) {
+                            $prompt_text = $point->name;
+                        }
+                        $this->send_reply($chat_id, "📌 <b>Промт для точки</b>\n\n<pre>" . esc_html($prompt_text) . "</pre>");
+                        $this->answer_callback_query($callback_query['id'], 'Промт отправлен для копирования');
+                    } else {
+                        $this->answer_callback_query($callback_query['id'], 'Вывод промта отключен в настройках');
+                    }
                 }
-                $this->answer_callback_query($callback_query['id'], '✅ Вы остаетесь в текущей точке');
                 return true;
             
             default:
@@ -1286,6 +1573,11 @@ class TCM_Telegram {
      * Показ главного меню
      */
     private function show_main_menu($chat_id) {
+        // Получаем user_id_telegram из текущего контекста
+        // Если вызывается из callback, нужно передавать user_id_telegram
+        // Для упрощения, получаем из последнего сообщения или используем chat_id как fallback
+        $user_id_telegram = $chat_id; // Временное решение, нужно будет передавать user_id_telegram
+        
         $keyboard = array(
             array(
                 array('text' => '📂 Выбор Шага', 'callback_data' => 'category:0')
@@ -1310,9 +1602,85 @@ class TCM_Telegram {
     }
     
     /**
+     * Показ главного меню с user_id_telegram для проверки следующей точки
+     */
+    private function show_main_menu_with_user($chat_id, $user_id_telegram) {
+        $keyboard = array(
+            array(
+                array('text' => '📂 Выбор Шага', 'callback_data' => 'category:0')
+            ),
+            array(
+                array('text' => '📝 Мои записи', 'callback_data' => 'view_posts:menu'),
+                array('text' => '📄 Последняя запись', 'callback_data' => 'view_last_post')
+            )
+        );
+        
+        // Получаем текущую выбранную категорию
+        $current_category_id = $this->get_category_for_chat($chat_id, $user_id_telegram);
+        $current_info = '';
+        
+        if ($current_category_id > 0) {
+            $wp_user_id = $this->get_wp_user_id($user_id_telegram);
+            $step_id = $this->get_category_at_level($current_category_id, 0);
+            $chapter_id = $this->get_category_at_level($current_category_id, 1);
+            $point_id = $this->get_category_at_level($current_category_id, 2);
+            
+            if ($point_id) {
+                $point = get_category($point_id);
+                if ($point) {
+                    $posts_count = $wp_user_id ? $this->get_category_posts_count($point_id, $wp_user_id) : 0;
+                    $current_info = "\n📍 <b>Текущая Точка:</b> " . esc_html($point->name);
+                    if ($posts_count > 0) {
+                        $current_info .= ' (' . $posts_count . ')';
+                    }
+                }
+            } elseif ($chapter_id) {
+                $chapter = get_category($chapter_id);
+                if ($chapter) {
+                    $current_info = "\n📖 <b>Текущая Глава:</b> " . esc_html($chapter->name);
+                }
+            } elseif ($step_id) {
+                $step = get_category($step_id);
+                if ($step) {
+                    $current_info = "\n📚 <b>Текущий Шаг:</b> " . esc_html($step->name);
+                }
+            }
+        }
+        
+        // Проверяем, есть ли следующая точка для текущей выбранной категории
+        $next_point = $this->get_next_point_for_user($chat_id, $user_id_telegram);
+        if ($next_point) {
+            $next_point_name_short = mb_strlen($next_point['name']) > 30 ? mb_substr($next_point['name'], 0, 27) . '...' : $next_point['name'];
+            $keyboard[] = array(
+                array('text' => '➡️ Перейти в следующую точку: ' . $next_point_name_short, 'callback_data' => 'go_to_next_point:' . $next_point['id'])
+            );
+        }
+        
+        $keyboard[] = array(
+            array('text' => '⚙️ Настройки', 'callback_data' => 'settings'),
+            array('text' => '❓ Справка', 'callback_data' => 'help')
+        );
+        $keyboard[] = array(
+            array('text' => '💬 Техподдержка', 'callback_data' => 'support')
+        );
+        
+        $text = "🤖 <b>Главное меню</b>" . $current_info . "\n\n" .
+                "Выберите действие:";
+        
+        return $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
+    }
+    
+    /**
      * Показ главного меню с прилипающей клавиатурой (Reply Keyboard)
      */
     private function show_main_menu_with_reply_keyboard($chat_id) {
+        // Пытаемся определить следующую точку для пользователя (используем chat_id как fallback для user_id)
+        $next_point = $this->get_next_point_for_user($chat_id, $chat_id);
+        $next_point_row = array();
+        if ($next_point) {
+            $next_point_row[] = array('text' => '➡️ Перейти в следующую точку');
+        }
+        
         $keyboard = array(
             array(
                 array('text' => '📂 Выбор Шага'),
@@ -1326,6 +1694,10 @@ class TCM_Telegram {
                 array('text' => '💬 Техподдержка')
             )
         );
+        
+        if (!empty($next_point_row)) {
+            $keyboard[] = $next_point_row;
+        }
         
         $text = "🤖 <b>Главное меню</b>\n\n" .
                 "Выберите действие из меню ниже:";
@@ -1422,6 +1794,21 @@ class TCM_Telegram {
                     return false;
                 }
                 return $this->show_view_posts_menu($chat_id, $wp_user_id);
+
+            case '➡️ Перейти в следующую точку':
+                // Переход в следующую точку (reply-клавиатура)
+                $next_point = $this->get_next_point_for_user($chat_id, $user_id_telegram);
+                if ($next_point) {
+                    // Сохраняем выбор и переходим
+                    $this->select_category($chat_id, $next_point['id'], $user_id_telegram);
+                } else {
+                    $this->send_reply_with_reply_keyboard(
+                        $chat_id,
+                        '❌ Следующая точка не найдена. Выберите шаг/главу вручную.',
+                        $this->get_main_reply_keyboard()
+                    );
+                }
+                return true;
             
             case '⚙️ Настройки':
                 return $this->show_settings($chat_id, $user_id_telegram);
@@ -1614,6 +2001,60 @@ class TCM_Telegram {
     }
     
     /**
+     * Получение количества записей в категории (с учетом всех дочерних категорий)
+     * 
+     * @param int $category_id ID категории
+     * @param int|null $user_id ID пользователя WordPress (если null, считает для всех пользователей)
+     * @return int Количество записей
+     */
+    private function get_category_posts_count($category_id, $user_id = null) {
+        $category = get_category($category_id);
+        if (!$category) {
+            return 0;
+        }
+        
+        // Собираем все ID категорий (текущая + все дочерние)
+        $category_ids = array($category_id);
+        
+        // Получаем все дочерние категории рекурсивно
+        $this->get_all_child_category_ids($category_id, $category_ids);
+        
+        // Подсчитываем записи
+        $args = array(
+            'category__in' => $category_ids,
+            'post_type' => 'post',
+            'post_status' => array('publish', 'draft'),
+            'numberposts' => -1,
+            'fields' => 'ids'
+        );
+        
+        if ($user_id !== null) {
+            $args['author'] = $user_id;
+        }
+        
+        $posts = get_posts($args);
+        return count($posts);
+    }
+    
+    /**
+     * Рекурсивное получение всех дочерних категорий
+     * 
+     * @param int $parent_id ID родительской категории
+     * @param array &$category_ids Массив для накопления ID категорий
+     */
+    private function get_all_child_category_ids($parent_id, &$category_ids) {
+        $children = get_categories(array(
+            'parent' => $parent_id,
+            'hide_empty' => false
+        ));
+        
+        foreach ($children as $child) {
+            $category_ids[] = $child->term_id;
+            $this->get_all_child_category_ids($child->term_id, $category_ids);
+        }
+    }
+    
+    /**
      * Получение следующей точки (следующей категории уровня "Точка")
      * 
      * @param int $current_point_id ID текущей точки
@@ -1720,6 +2161,61 @@ class TCM_Telegram {
     }
     
     /**
+     * Получение следующей точки для текущей выбранной категории пользователя
+     * 
+     * @param string $chat_id ID чата
+     * @param string $user_id_telegram Telegram ID пользователя
+     * @return array|false Массив с данными следующей точки или false
+     */
+    private function get_next_point_for_user($chat_id, $user_id_telegram) {
+        // Получаем выбранную категорию пользователя
+        $wp_user_id = $this->get_wp_user_id($user_id_telegram);
+        $category_id = 0;
+        
+        if ($wp_user_id) {
+            // Сначала пробуем получить из user meta (приоритет)
+            $category_id = get_user_meta($wp_user_id, 'tcm_selected_category_' . $chat_id, true);
+            if (!$category_id) {
+                $category_id = get_user_meta($wp_user_id, 'tcm_selected_category', true);
+            }
+        }
+        
+        // Если не нашли в user meta, пробуем из опций
+        if (!$category_id) {
+            $chat_categories = get_option('tcm_chat_categories', array());
+            $category_id = isset($chat_categories[$chat_id]) ? $chat_categories[$chat_id] : 0;
+        }
+        
+        if (!$category_id) {
+            return false;
+        }
+        
+        // Проверяем, является ли выбранная категория точкой
+        $current_category = get_category($category_id);
+        if (!$current_category) {
+            return false;
+        }
+        
+        // Определяем уровень категории
+        $level = 0;
+        $current = $current_category;
+        while ($current && $current->parent > 0) {
+            $level++;
+            $current = get_category($current->parent);
+            if (!$current) {
+                break;
+            }
+        }
+        
+        // Если это точка (уровень 2), получаем следующую точку
+        if ($level == 2) {
+            return $this->get_next_point($category_id);
+        }
+        
+        return false;
+    }
+    
+    /**
      * Предложение перехода в следующую точку
      * 
      * @param string $chat_id ID чата
@@ -1729,51 +2225,44 @@ class TCM_Telegram {
     private function offer_next_point($chat_id, $user_id_telegram, $current_point_id) {
         $next_point = $this->get_next_point($current_point_id);
         
-        if (!$next_point) {
-            // Нет следующей точки - предлагаем остаться в текущей
-            $current_point = get_category($current_point_id);
-            if ($current_point) {
-                $keyboard = array(
-                    array(
-                        array('text' => '📝 Оставить запись для текущей точки', 'callback_data' => 'stay_at_point:' . $current_point_id)
-                    ),
-                    array(
-                        array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
-                    )
-                );
-                
-                $message = "✅ <b>Это последняя точка в программе.</b>\n\n" .
-                          "Вы можете в любое время оставить запись для текущей точки: <b>" . esc_html($current_point->name) . "</b>";
-                
-                $this->send_reply_with_keyboard($chat_id, $message, $keyboard);
-            }
-            return;
-        }
-        
-        // Есть следующая точка - предлагаем выбор
-        // Ограничиваем длину названия точки для кнопки (максимум 30 символов)
-        $next_point_name_short = mb_strlen($next_point['name']) > 30 ? mb_substr($next_point['name'], 0, 27) . '...' : $next_point['name'];
-        
-        $keyboard = array(
-            array(
-                array('text' => '➡️ Перейти в следующую точку: ' . $next_point_name_short, 'callback_data' => 'go_to_next_point:' . $next_point['id'])
-            ),
-            array(
-                array('text' => '📝 Остаться в текущей точке', 'callback_data' => 'stay_at_point:' . $current_point_id)
-            ),
-            array(
-                array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
-            )
-        );
-        
         $current_point = get_category($current_point_id);
         $current_name = $current_point ? $current_point->name : 'текущей точки';
         
+        // Формируем кнопки
+        $keyboard = array();
+        
+        // Первая строка: информация о текущей точке
+        if ($current_point) {
+            $point_name_display = mb_strlen($current_name) > 35 ? mb_substr($current_name, 0, 32) . '...' : $current_name;
+            $keyboard[] = array(
+                array('text' => '📍 Вы в точке: ' . $point_name_display, 'callback_data' => 'copy_point_name:' . $current_point_id)
+            );
+        }
+        
+        if (!$next_point) {
+            // Нет следующей точки - только кнопка редактирования
+            $keyboard[] = array(
+                array('text' => '✏️ Редактировать точку', 'callback_data' => 'select_category:' . $current_point_id)
+            );
+            
+            $message = "🎯 <b>Что дальше?</b>\n\n" .
+                      "Это последняя точка в программе.\n\n" .
+                      "💡 Вы также можете в любое время оставить запись для текущей точки через меню.";
+            
+            $this->send_reply_with_keyboard($chat_id, $message, $keyboard);
+            return;
+        }
+        
+        // Есть следующая точка
         $message = "🎯 <b>Что дальше?</b>\n\n" .
-                  "Вы можете:\n" .
-                  "• Перейти в следующую точку: <b>" . esc_html($next_point['name']) . "</b>\n" .
-                  "• Остаться в текущей точке: <b>" . esc_html($current_name) . "</b>\n\n" .
-                  "💡 <i>Вы также можете в любое время оставить запись для текущей точки через меню.</i>";
+                  "Вы можете перейти в следующую точку: <b>" . esc_html($next_point['name']) . "</b>\n\n" .
+                  "💡 Вы также можете в любое время оставить запись для текущей точки через меню.";
+        
+        // Вторая строка: кнопки редактирования и перехода
+        $keyboard[] = array(
+            array('text' => '✏️ Редактировать точку', 'callback_data' => 'select_category:' . $current_point_id),
+            array('text' => '➡️ Перейти к следующей точке', 'callback_data' => 'go_to_next_point:' . $next_point['id'])
+        );
         
         $this->send_reply_with_keyboard($chat_id, $message, $keyboard);
     }
@@ -1786,6 +2275,9 @@ class TCM_Telegram {
         
         // Получаем текущую выбранную категорию для пользователя/чата
         $selected_category_id = $this->get_category_for_chat($chat_id, $user_id_telegram);
+        
+        // Получаем WordPress ID пользователя для подсчета записей
+        $wp_user_id = $this->get_wp_user_id($user_id_telegram);
         
         // Получаем категории с сортировкой как в навигации (по term_id)
         $args = array(
@@ -1857,10 +2349,21 @@ class TCM_Telegram {
                 $category_name = $step_number . 'Шаг ' . $category_name;
             }
             
+            // Получаем количество записей пользователя в этой категории
+            $posts_count = $wp_user_id ? $this->get_category_posts_count($category->term_id, $wp_user_id) : 0;
+            
+            // Формируем текст кнопки: (количество) иконка название
+            $button_text = '';
+            if ($posts_count > 0) {
+                $button_text = '(' . $posts_count . ') ' . $icon . ' ' . $category_name;
+            } else {
+                $button_text = $icon . ' ' . $category_name;
+            }
+            
             // Каждая категория в отдельном ряду (один столбец)
             $keyboard[] = array(
                 array(
-                    'text' => $icon . ' ' . $category_name,
+                    'text' => $button_text,
                     'callback_data' => !empty($has_children) ? 'category:' . $category->term_id : 'select_category:' . $category->term_id
                 )
             );
@@ -1871,7 +2374,37 @@ class TCM_Telegram {
             array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
         );
         
-        $text = "📂 <b>Выбор " . $level_name_genitive . "</b>\n\n";
+        // Получаем информацию о текущей выбранной точке
+        $current_info = '';
+        if ($selected_category_id > 0) {
+            $wp_user_id = $this->get_wp_user_id($user_id_telegram);
+            $step_id = $this->get_category_at_level($selected_category_id, 0);
+            $chapter_id = $this->get_category_at_level($selected_category_id, 1);
+            $point_id = $this->get_category_at_level($selected_category_id, 2);
+            
+            if ($point_id) {
+                $point = get_category($point_id);
+                if ($point) {
+                    $posts_count = $wp_user_id ? $this->get_category_posts_count($point_id, $wp_user_id) : 0;
+                    $current_info = "\n📍 <b>Текущая Точка:</b> " . esc_html($point->name);
+                    if ($posts_count > 0) {
+                        $current_info .= ' (' . $posts_count . ')';
+                    }
+                }
+            } elseif ($chapter_id) {
+                $chapter = get_category($chapter_id);
+                if ($chapter) {
+                    $current_info = "\n📖 <b>Текущая Глава:</b> " . esc_html($chapter->name);
+                }
+            } elseif ($step_id) {
+                $step = get_category($step_id);
+                if ($step) {
+                    $current_info = "\n📚 <b>Текущий Шаг:</b> " . esc_html($step->name);
+                }
+            }
+        }
+        
+        $text = "📂 <b>Выбор " . $level_name_genitive . "</b>" . $current_info . "\n\n";
         if ($parent_id > 0) {
             $parent = get_category($parent_id);
             if ($parent) {
@@ -2054,6 +2587,15 @@ class TCM_Telegram {
         
         $keyboard = array();
         
+        // Проверяем, есть ли следующая точка для выбранной категории
+        $next_point = $this->get_next_point($category_id);
+        if ($next_point) {
+            $next_point_name_short = mb_strlen($next_point['name']) > 30 ? mb_substr($next_point['name'], 0, 27) . '...' : $next_point['name'];
+            $keyboard[] = array(
+                array('text' => '➡️ Перейти в следующую точку: ' . $next_point_name_short, 'callback_data' => 'go_to_next_point:' . $next_point['id'])
+            );
+        }
+        
         // Добавляем кнопку ИИ ассистента с учетом PRO статуса
         if ($is_pro) {
             $keyboard[] = array(
@@ -2071,6 +2613,18 @@ class TCM_Telegram {
         $keyboard[] = array(
             array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
         );
+        
+        // Добавляем информацию о текущей точке, если выбрана точка
+        $point_id = $this->get_category_at_level($category_id, 2);
+        if ($point_id) {
+            $point = get_category($point_id);
+            if ($point) {
+                $point_name_display = mb_strlen($point->name) > 35 ? mb_substr($point->name, 0, 32) . '...' : $point->name;
+                $keyboard[] = array(
+                    array('text' => '📍 Вы в точке: ' . $point_name_display, 'callback_data' => 'copy_point_name:' . $point_id)
+                );
+            }
+        }
         
         if ($log_enabled) {
             error_log('TCM: Preparing to send confirmation message');
@@ -2111,6 +2665,17 @@ class TCM_Telegram {
             return $fallback_result;
         }
         
+        // Если выбрана точка, отправляем промт отдельным сообщением для копирования
+        // Проверяем настройку вывода промта
+        $show_prompt = get_option('tcm_show_prompt', true);
+        if ($point_id && $show_prompt) {
+            $prompt_text = $this->build_point_prompt($point_id, $user_id_telegram);
+            if (!empty($prompt_text)) {
+                $prompt_message = "📌 <b>Промт для точки</b>\n\n<pre>" . esc_html($prompt_text) . "</pre>";
+                $this->send_reply($chat_id, $prompt_message);
+            }
+        }
+        
         return $result;
     }
     
@@ -2137,7 +2702,13 @@ class TCM_Telegram {
         if ($category_id > 0) {
             $category = get_category($category_id);
             if ($category) {
-                $text .= "📂 <b>Текущая категория:</b> " . esc_html($category->name) . "\n\n";
+                $wp_user_id = $this->get_wp_user_id($user_id_telegram);
+                $posts_count = $wp_user_id ? $this->get_category_posts_count($category_id, $wp_user_id) : $this->get_category_posts_count($category_id);
+                $category_name = esc_html($category->name);
+                if ($posts_count > 0) {
+                    $category_name .= ' (' . $posts_count . ')';
+                }
+                $text .= "📂 <b>Текущая категория:</b> " . $category_name . "\n\n";
             }
         } else {
             $text .= "📂 <b>Категория:</b> Не выбрана\n\n";
@@ -2188,9 +2759,20 @@ class TCM_Telegram {
             );
         }
         
+        // Проверяем, есть ли следующая точка для текущей выбранной категории
         $keyboard[] = array(
             array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
         );
+        
+        if ($category_id > 0) {
+            $next_point = $this->get_next_point($category_id);
+            if ($next_point) {
+                $next_point_name_short = mb_strlen($next_point['name']) > 30 ? mb_substr($next_point['name'], 0, 27) . '...' : $next_point['name'];
+                $keyboard[] = array(
+                    array('text' => '➡️ Перейти в следующую точку: ' . $next_point_name_short, 'callback_data' => 'go_to_next_point:' . $next_point['id'])
+                );
+            }
+        }
         
         return $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
     }
@@ -2212,11 +2794,25 @@ class TCM_Telegram {
                 "/help - показать справку\n\n" .
                 "💡 <b>Совет:</b> Используйте меню для удобной навигации.";
         
-        $keyboard = array(
-            array(
-                array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
-            )
+        $keyboard = array();
+        
+        // Пытаемся получить user_id_telegram из контекста
+        // Если вызывается из callback, user_id_telegram должен быть передан
+        // Для упрощения, используем chat_id как fallback
+        $user_id_telegram = $chat_id;
+        
+        $keyboard[] = array(
+            array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
         );
+        
+        // Проверяем, есть ли следующая точка для текущей выбранной категории
+        $next_point = $this->get_next_point_for_user($chat_id, $user_id_telegram);
+        if ($next_point) {
+            $next_point_name_short = mb_strlen($next_point['name']) > 30 ? mb_substr($next_point['name'], 0, 27) . '...' : $next_point['name'];
+            $keyboard[] = array(
+                array('text' => '➡️ Перейти в следующую точку: ' . $next_point_name_short, 'callback_data' => 'go_to_next_point:' . $next_point['id'])
+            );
+        }
         
         return $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
     }
@@ -2239,11 +2835,24 @@ class TCM_Telegram {
         $keyboard = array(
             array(
                 array('text' => '📝 Отправить сообщение в поддержку', 'callback_data' => 'support_send_message')
-            ),
-            array(
-                array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
             )
         );
+        
+        $keyboard[] = array(
+            array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
+        );
+        
+        // Проверяем, есть ли следующая точка для текущей выбранной категории
+        if (empty($user_id_telegram)) {
+            $user_id_telegram = $chat_id; // Fallback
+        }
+        $next_point = $this->get_next_point_for_user($chat_id, $user_id_telegram);
+        if ($next_point) {
+            $next_point_name_short = mb_strlen($next_point['name']) > 30 ? mb_substr($next_point['name'], 0, 27) . '...' : $next_point['name'];
+            $keyboard[] = array(
+                array('text' => '➡️ Перейти в следующую точку: ' . $next_point_name_short, 'callback_data' => 'go_to_next_point:' . $next_point['id'])
+            );
+        }
         
         return $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
     }
@@ -2514,15 +3123,15 @@ class TCM_Telegram {
                         'type' => 'multiple',
                         'options' => array('Алкоголь', 'Никотин', 'Наркотики', 'Игровая/гэмблинг', 'Пищевая', 'Интернет и соцсети', 'Другое')
                     ),
-                    'addiction_years' => array(
-                        'text' => 'Стаж зависимости (лет/месяцев)',
-                        'type' => 'text',
-                        'hint' => 'Например: 5 лет, 2 года 3 месяца'
-                    ),
                     'last_use_date' => array(
                         'text' => 'Дата последнего употребления/срыва',
                         'type' => 'text',
                         'hint' => 'Формат: ДД.ММ.ГГГГ или "сегодня", "вчера", "неделю назад"'
+                    ),
+                    'addiction_years' => array(
+                        'text' => 'Стаж зависимости (лет/месяцев)',
+                        'type' => 'text',
+                        'hint' => 'Например: 5 лет, 2 года 3 месяца'
                     ),
                     'use_form' => array(
                         'text' => 'Форма употребления',
@@ -2928,8 +3537,8 @@ class TCM_Telegram {
             return $this->request_data_collection_consent($chat_id, $user_id_telegram, $wp_user_id);
         }
         
-        // Получаем следующий неотвеченный вопрос
-        $next_question = $this->get_next_unanswered_question($wp_user_id);
+        // Получаем следующий неотвеченный вопрос (разрешаем повтор последнего, чтобы напоминать после точки)
+        $next_question = $this->get_next_unanswered_question($wp_user_id, true);
         
         if ($log_enabled) {
             error_log('TCM: Next question: ' . ($next_question ? 'found' : 'not found'));
@@ -2989,40 +3598,6 @@ class TCM_Telegram {
             )
         );
         
-        // Получаем текущую категорию для добавления кнопок редактирования точки и перехода к следующей
-        $current_category_id = $this->get_category_for_chat($chat_id, $user_id_telegram);
-        if ($current_category_id) {
-            $current_category = get_category($current_category_id);
-            if ($current_category) {
-                // Определяем уровень категории
-                $level = 0;
-                $current = $current_category;
-                while ($current && $current->parent > 0) {
-                    $level++;
-                    $current = get_category($current->parent);
-                    if (!$current) {
-                        break;
-                    }
-                }
-                
-                // Если это точка (уровень 2), добавляем кнопки редактирования и перехода
-                if ($level == 2) {
-                    $next_point = $this->get_next_point($current_category_id);
-                    if ($next_point) {
-                        $next_point_name_short = mb_strlen($next_point['name']) > 30 ? mb_substr($next_point['name'], 0, 27) . '...' : $next_point['name'];
-                        $keyboard[] = array(
-                            array('text' => '✏️ Редактировать точку', 'callback_data' => 'select_category:' . $current_category_id),
-                            array('text' => '➡️ Следующая точка', 'callback_data' => 'go_to_next_point:' . $next_point['id'])
-                        );
-                    } else {
-                        $keyboard[] = array(
-                            array('text' => '✏️ Редактировать точку', 'callback_data' => 'select_category:' . $current_category_id)
-                        );
-                    }
-                }
-            }
-        }
-        
         // Сохраняем текущий вопрос для обработки ответа
         update_user_meta($wp_user_id, 'tcm_questionnaire_current_question', array(
             'section_key' => $section_key,
@@ -3051,7 +3626,7 @@ class TCM_Telegram {
     /**
      * Получение следующего неотвеченного вопроса
      */
-    private function get_next_unanswered_question($wp_user_id) {
+    private function get_next_unanswered_question($wp_user_id, $allow_repeat_last = false) {
         $log_enabled = defined('WP_DEBUG') && WP_DEBUG;
         
         $answers = get_user_meta($wp_user_id, 'tcm_questionnaire_answers', true);
@@ -3080,7 +3655,11 @@ class TCM_Telegram {
         
         // Ищем первый неотвеченный вопрос, который еще не показывали в последний раз
         $last_shown = isset($shown_questions['last_shown']) ? $shown_questions['last_shown'] : null;
-        $found_after_last = false;
+        // Если разрешено повторять последний, сбрасываем фильтр
+        if ($allow_repeat_last) {
+            $last_shown = null;
+        }
+        $found_after_last = $allow_repeat_last;
         $question_counter = 0;
         
         // Проверяем, существует ли last_shown в текущей структуре
@@ -3189,7 +3768,9 @@ class TCM_Telegram {
         
         $parts = explode(':', $action);
         $action_type = isset($parts[0]) ? $parts[0] : $action;
-        $action_param = isset($parts[1]) ? $parts[1] : '';
+        // Важно: параметры могут содержать несколько сегментов через ':'
+        // Пример: edit:section_key:question_key
+        $action_param = count($parts) > 1 ? implode(':', array_slice($parts, 1)) : '';
         
         switch ($action_type) {
             case 'start':
@@ -3216,6 +3797,16 @@ class TCM_Telegram {
                 $wp_user_id = $this->get_wp_user_id($user_id_telegram);
                 if ($wp_user_id) {
                     return $this->show_next_questionnaire_question($chat_id, $user_id_telegram, $wp_user_id);
+                }
+                return false;
+                
+            case 'edit':
+                // Редактирование вопроса анкеты
+                $params = explode(':', $action_param);
+                if (count($params) >= 2) {
+                    $edit_section_key = $params[0];
+                    $edit_question_key = $params[1];
+                    return $this->edit_questionnaire_question($chat_id, $edit_section_key, $edit_question_key, $user_id_telegram);
                 }
                 return false;
                 
@@ -3316,19 +3907,131 @@ class TCM_Telegram {
         $text .= "• Для вопросов с несколькими вариантами - отправьте номера через запятую (например: 1, 3, 5)\n";
         $text .= "• Для текстовых вопросов - отправьте ваш ответ\n\n";
         $text .= "Отправьте сообщение в формате: <code>номер_вопроса: ваш_ответ</code>\n";
-        $text .= "Например: <code>1: 25</code> или <code>2: 1,3</code>";
+        $text .= "Например: <code>1: 25</code> или <code>2: 1,3</code>\n\n";
+        $text .= "Или используйте кнопки ниже для редактирования ответов.";
         
-        $keyboard = array(
-            array(
-                array('text' => '📋 К другим разделам', 'callback_data' => 'questionnaire:start')
-            ),
-            array(
-                array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
-            )
+        $keyboard = array();
+        
+        // Добавляем кнопки редактирования для каждого вопроса
+        $question_num = 1;
+        $edit_buttons = array();
+        foreach ($section['questions'] as $question_key => $question) {
+            $answer = isset($answers[$section_key][$question_key]) ? $answers[$section_key][$question_key] : '';
+            if (!empty($answer)) {
+                $answer_preview = is_array($answer) ? implode(', ', array_slice($answer, 0, 1)) : mb_substr($answer, 0, 15);
+                if (is_array($answer) && count($answer) > 1) {
+                    $answer_preview .= '...';
+                } elseif (!is_array($answer) && mb_strlen($answer) > 15) {
+                    $answer_preview .= '...';
+                }
+                $button_text = '✏️ ' . $question_num . ': ' . $answer_preview;
+                // Ограничиваем длину кнопки (максимум 64 символа для Telegram)
+                if (mb_strlen($button_text) > 50) {
+                    $button_text = '✏️ Вопрос ' . $question_num;
+                }
+                $edit_buttons[] = array(
+                    'text' => $button_text,
+                    'callback_data' => 'questionnaire:edit:' . $section_key . ':' . $question_key
+                );
+            }
+            $question_num++;
+        }
+        
+        // Добавляем кнопки редактирования (по 2 в ряд, если их много)
+        if (!empty($edit_buttons)) {
+            $chunked_buttons = array_chunk($edit_buttons, 2);
+            foreach ($chunked_buttons as $chunk) {
+                $keyboard[] = $chunk;
+            }
+        }
+        
+        // Кнопки навигации
+        $keyboard[] = array(
+            array('text' => '📋 К другим разделам', 'callback_data' => 'questionnaire:start')
+        );
+        $keyboard[] = array(
+            array('text' => '🏠 Главное меню', 'callback_data' => 'menu')
         );
         
         // Сохраняем текущий раздел для обработки ответов
         update_user_meta($wp_user_id, 'tcm_questionnaire_current_section', $section_key);
+        
+        return $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
+    }
+    
+    /**
+     * Редактирование вопроса анкеты
+     */
+    private function edit_questionnaire_question($chat_id, $section_key, $question_key, $user_id_telegram) {
+        $structure = $this->get_questionnaire_structure();
+        
+        if (!isset($structure[$section_key]['questions'][$question_key])) {
+            $this->send_reply($chat_id, '❌ Вопрос не найден.');
+            return false;
+        }
+        
+        $wp_user_id = $this->get_wp_user_id($user_id_telegram);
+        if (!$wp_user_id) {
+            $this->send_reply($chat_id, '❌ Пользователь не найден.');
+            return false;
+        }
+        
+        $question = $structure[$section_key]['questions'][$question_key];
+        $answers = get_user_meta($wp_user_id, 'tcm_questionnaire_answers', true);
+        if (!is_array($answers)) {
+            $answers = array();
+        }
+        
+        $current_answer = isset($answers[$section_key][$question_key]) ? $answers[$section_key][$question_key] : '';
+        
+        // Формируем текст вопроса
+        $text = "✏️ <b>Редактирование ответа</b>\n\n";
+        $text .= "<b>" . $question['text'] . "</b>\n\n";
+        
+        // Показываем текущий ответ, если есть
+        if (!empty($current_answer)) {
+            $answer_display = is_array($current_answer) ? implode(', ', $current_answer) : $current_answer;
+            $text .= "📝 <b>Текущий ответ:</b> " . $answer_display . "\n\n";
+        }
+        
+        // Показываем варианты ответа в скобках
+        if (isset($question['options']) && is_array($question['options'])) {
+            $options_list = array();
+            $option_num = 1;
+            foreach ($question['options'] as $option) {
+                $options_list[] = $option_num . ". " . $option;
+                $option_num++;
+            }
+            $text .= "Варианты ответа: (" . implode(", ", $options_list) . ")\n\n";
+            
+            if ($question['type'] === 'multiple') {
+                $text .= "💡 Вы можете выбрать несколько вариантов, указав номера через запятую (например: 1, 3, 5)\n\n";
+            } else {
+                $text .= "💡 Укажите номер варианта или введите текст ответа\n\n";
+            }
+        } else {
+            if (isset($question['hint'])) {
+                $text .= "💡 " . $question['hint'] . "\n\n";
+            } else {
+                $text .= "💡 Введите ваш ответ текстом\n\n";
+            }
+        }
+        
+        $text .= "Отправьте новый ответ на этот вопрос.";
+        
+        // Создаем клавиатуру
+        $keyboard = array(
+            array(
+                array('text' => '❌ Отмена', 'callback_data' => 'questionnaire:section:' . $section_key)
+            )
+        );
+        
+        // Сохраняем текущий вопрос для обработки ответа
+        update_user_meta($wp_user_id, 'tcm_questionnaire_current_question', array(
+            'section_key' => $section_key,
+            'question_key' => $question_key,
+            'is_editing' => true
+        ));
         
         return $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
     }
@@ -3524,9 +4227,17 @@ class TCM_Telegram {
                     }
                 }
                 if (!$found) {
-                    // Неверный ответ, но не показываем ошибку - просто пропускаем
-                    delete_user_meta($wp_user_id, 'tcm_questionnaire_current_question');
-                    return false; // Продолжаем как обычное сообщение
+                    // Неверный ответ
+                    $is_editing = isset($current_question['is_editing']) && $current_question['is_editing'];
+                    if ($is_editing) {
+                        // В режиме редактирования показываем ошибку
+                        $this->send_reply($chat_id, '❌ Неверный вариант ответа. Пожалуйста, выберите номер из списка или введите точный текст варианта.');
+                        return true; // Не создаем запись
+                    } else {
+                        // Не в режиме редактирования - пропускаем
+                        delete_user_meta($wp_user_id, 'tcm_questionnaire_current_question');
+                        return false; // Продолжаем как обычное сообщение
+                    }
                 }
             }
         } elseif ($question['type'] === 'multiple' && isset($question['options'])) {
@@ -3542,9 +4253,17 @@ class TCM_Telegram {
             }
             
             if (empty($selected_options)) {
-                // Неверный ответ, пропускаем
-                delete_user_meta($wp_user_id, 'tcm_questionnaire_current_question');
-                return false;
+                // Неверный ответ
+                $is_editing = isset($current_question['is_editing']) && $current_question['is_editing'];
+                if ($is_editing) {
+                    // В режиме редактирования показываем ошибку
+                    $this->send_reply($chat_id, '❌ Неверные номера вариантов. Пожалуйста, укажите номера через запятую (например: 1, 3, 5)');
+                    return true; // Не создаем запись
+                } else {
+                    // Не в режиме редактирования - пропускаем
+                    delete_user_meta($wp_user_id, 'tcm_questionnaire_current_question');
+                    return false;
+                }
             }
             
             $processed_answer = $selected_options;
@@ -3576,6 +4295,9 @@ class TCM_Telegram {
             $processed_answer = sanitize_text_field($answer_text);
         }
         
+        // Проверяем, является ли это редактированием
+        $is_editing = isset($current_question['is_editing']) && $current_question['is_editing'];
+        
         // Сохраняем ответ
         $answers[$section_key][$question_key] = $processed_answer;
         update_user_meta($wp_user_id, 'tcm_questionnaire_answers', $answers);
@@ -3584,56 +4306,60 @@ class TCM_Telegram {
         delete_user_meta($wp_user_id, 'tcm_questionnaire_current_question');
         
         if ($log_enabled) {
-            error_log('TCM: Questionnaire answer saved. Section: ' . $section_key . ', Question: ' . $question_key . ', Answer: ' . print_r($processed_answer, true));
+            error_log('TCM: Questionnaire answer saved. Section: ' . $section_key . ', Question: ' . $question_key . ', Answer: ' . print_r($processed_answer, true) . ', Is editing: ' . ($is_editing ? 'yes' : 'no'));
         }
         
         // Показываем подтверждение
         $answer_display = is_array($processed_answer) ? implode(', ', $processed_answer) : $processed_answer;
         $status = $this->get_questionnaire_status($user_id_telegram);
-        $message = "✅ <b>Ответ сохранен!</b>\n\n" .
-                   "Ваш ответ: " . $answer_display . "\n\n" .
-                   "Прогресс заполнения: " . $status['progress'] . "% (" . $status['answered'] . " из " . $status['total'] . " вопросов)";
         
-        // Получаем текущую выбранную категорию пользователя для добавления кнопок
-        $current_category_id = $this->get_category_for_chat($chat_id, $user_id_telegram);
-        $keyboard = array();
-        
-        if ($current_category_id) {
-            $current_category = get_category($current_category_id);
-            if ($current_category) {
-                // Определяем уровень категории
-                $level = 0;
-                $current = $current_category;
-                while ($current && $current->parent > 0) {
-                    $level++;
-                    $current = get_category($current->parent);
-                    if (!$current) {
-                        break;
+        if ($is_editing) {
+            // Режим редактирования - возвращаем в раздел анкеты
+            $message = "✅ <b>Ответ обновлен!</b>\n\n" .
+                       "Вопрос: " . $question['text'] . "\n" .
+                       "Новый ответ: " . $answer_display . "\n\n" .
+                       "Прогресс заполнения: " . $status['progress'] . "% (" . $status['answered'] . " из " . $status['total'] . " вопросов)";
+            
+            $this->send_reply($chat_id, $message);
+            
+            // Небольшая задержка перед возвратом в раздел
+            usleep(500000); // 0.5 секунды
+            
+            // Возвращаемся в раздел анкеты
+            return $this->show_questionnaire_section($chat_id, $section_key, $user_id_telegram);
+        } else {
+            // Обычный режим - показываем подтверждение и "Что дальше?"
+            $message = "✅ <b>Ответ сохранен!</b>\n\n" .
+                       "Ваш ответ: " . $answer_display . "\n\n" .
+                       "Прогресс заполнения: " . $status['progress'] . "% (" . $status['answered'] . " из " . $status['total'] . " вопросов)";
+            
+            $this->send_reply($chat_id, $message);
+            
+            // Получаем текущую выбранную категорию пользователя
+            $current_category_id = $this->get_category_for_chat($chat_id, $user_id_telegram);
+            
+            if ($current_category_id) {
+                $current_category = get_category($current_category_id);
+                if ($current_category) {
+                    // Определяем уровень категории
+                    $level = 0;
+                    $current = $current_category;
+                    while ($current && $current->parent > 0) {
+                        $level++;
+                        $current = get_category($current->parent);
+                        if (!$current) {
+                            break;
+                        }
                     }
-                }
-                
-                // Если это точка (уровень 2), добавляем кнопки редактирования и перехода
-                if ($level == 2) {
-                    $next_point = $this->get_next_point($current_category_id);
-                    if ($next_point) {
-                        $next_point_name_short = mb_strlen($next_point['name']) > 30 ? mb_substr($next_point['name'], 0, 27) . '...' : $next_point['name'];
-                        $keyboard[] = array(
-                            array('text' => '✏️ Редактировать точку', 'callback_data' => 'select_category:' . $current_category_id),
-                            array('text' => '➡️ Следующая точка', 'callback_data' => 'go_to_next_point:' . $next_point['id'])
-                        );
-                    } else {
-                        $keyboard[] = array(
-                            array('text' => '✏️ Редактировать точку', 'callback_data' => 'select_category:' . $current_category_id)
-                        );
+                    
+                    // Если это точка (уровень 2), показываем "Что дальше?"
+                    if ($level == 2) {
+                        // Небольшая задержка перед показом "Что дальше?"
+                        usleep(300000); // 0.3 секунды
+                        $this->offer_next_point($chat_id, $user_id_telegram, $current_category_id);
                     }
                 }
             }
-        }
-        
-        if (!empty($keyboard)) {
-            $this->send_reply_with_keyboard($chat_id, $message, $keyboard);
-        } else {
-            $this->send_reply($chat_id, $message);
         }
         
         // Возвращаем true, чтобы НЕ создавать запись из ответа на вопрос анкеты
@@ -3669,10 +4395,29 @@ class TCM_Telegram {
         // Очищаем текущий вопрос
         delete_user_meta($wp_user_id, 'tcm_questionnaire_current_question');
         
-        $this->send_reply($chat_id, '✅ Вопрос пропущен. Вы можете ответить на него позже.');
+        // Получаем текущую выбранную категорию пользователя
+        $current_category_id = $this->get_category_for_chat($chat_id, $user_id_telegram);
         
-        // Показываем следующий вопрос
-        $this->show_next_questionnaire_question($chat_id, $user_id_telegram, $wp_user_id);
+        if ($current_category_id) {
+            $current_category = get_category($current_category_id);
+            if ($current_category) {
+                // Определяем уровень категории
+                $level = 0;
+                $current = $current_category;
+                while ($current && $current->parent > 0) {
+                    $level++;
+                    $current = get_category($current->parent);
+                    if (!$current) {
+                        break;
+                    }
+                }
+                
+                // Если это точка (уровень 2), показываем "Что дальше?"
+                if ($level == 2) {
+                    $this->offer_next_point($chat_id, $user_id_telegram, $current_category_id);
+                }
+            }
+        }
         
         return true;
     }
@@ -3839,13 +4584,39 @@ class TCM_Telegram {
             return '❌ Превышен лимит запросов к DeepSeek API. Попробуйте позже.';
         }
         
+        // Обработка таймаутов
+        $error_type = isset($error['type']) ? $error['type'] : '';
+        if ($error_type == 'timeout' || stripos($message, 'timeout') !== false || stripos($message, 'timed out') !== false || stripos($message, 'Operation timed out') !== false) {
+            return '❌ Превышено время ожидания ответа от DeepSeek API (таймаут). Это может быть связано с большой нагрузкой на сервер или медленным интернет-соединением. Попробуйте позже или обратитесь к администратору.';
+        }
+        
+        // Обработка неожиданной структуры ответа
+        if ($error_type == 'unexpected_structure') {
+            return '❌ Получен неожиданный ответ от DeepSeek API. Попробуйте обновить запрос или обратитесь к администратору.';
+        }
+        
+        // Обработка пустого ответа
+        if ($error_type == 'empty_response') {
+            return '❌ Получен пустой ответ от DeepSeek API. Попробуйте обновить запрос или обратитесь к администратору.';
+        }
+        
         if ($code >= 500) {
             return '❌ Временная ошибка сервера DeepSeek API. Попробуйте позже.';
         }
         
         // Общее сообщение с деталями ошибки
         if (!empty($message)) {
-            return '❌ Ошибка DeepSeek API: ' . $message . '. Обратитесь к администратору.';
+            // Сокращаем технические детали для пользователя
+            $user_message = $message;
+            if (stripos($message, 'cURL error') !== false) {
+                // Упрощаем сообщение об ошибке cURL
+                if (stripos($message, 'timeout') !== false) {
+                    $user_message = 'Таймаут соединения';
+                } else {
+                    $user_message = 'Ошибка соединения с API';
+                }
+            }
+            return '❌ Ошибка DeepSeek API: ' . $user_message . '. Обратитесь к администратору.';
         }
         
         return null;
@@ -3937,6 +4708,54 @@ class TCM_Telegram {
      */
     private function clear_conversation_history($wp_user_id) {
         delete_user_meta($wp_user_id, 'tcm_ai_conversation_history');
+    }
+    
+    /**
+     * Формирование пользовательского промта для выбранной точки с учетом анкеты
+     */
+    private function build_point_prompt($category_id, $user_id_telegram) {
+        $category = get_category($category_id);
+        if (!$category) {
+            return '';
+        }
+        
+        // Строим путь категории
+        $category_path = array();
+        $current_category = $category;
+        while ($current_category) {
+            $category_path[] = $current_category->name;
+            if ($current_category->parent > 0) {
+                $current_category = get_category($current_category->parent);
+            } else {
+                break;
+            }
+        }
+        $category_path = array_reverse($category_path);
+        $full_path = implode(' → ', $category_path);
+        
+        $level_name_prepositional = $this->get_category_level_name($category_id, 'prepositional');
+        
+        $prompt = "Ты - помощник в программе 12 шагов для людей, страдающих зависимостью. Пользователь выбрал " . $level_name_prepositional . " \"" . $category->name . "\" (полный путь: " . $full_path . ").\n\n";
+        $prompt .= "Предоставь помощь по этой точке, включая:\n";
+        $prompt .= "1. Выдержки из одобренной литературы, релевантные для этой точки\n";
+        $prompt .= "2. Примеры из жизни других зависимых, которые прошли через эту точку\n";
+        $prompt .= "3. Практические рекомендации по применению программы в действии для этой конкретной точки\n";
+        $prompt .= "4. Персонализированные советы, которые помогут пользователю продвинуться дальше\n\n";
+        $prompt .= "Ответ должен быть структурированным, полезным и мотивирующим. Используй форматирование для лучшей читаемости.";
+        
+        // Добавляем данные анкеты
+        $wp_user_id = $this->get_wp_user_id($user_id_telegram);
+        if ($wp_user_id) {
+            $questionnaire_answers = get_user_meta($wp_user_id, 'tcm_questionnaire_answers', true);
+            if (is_array($questionnaire_answers) && !empty($questionnaire_answers)) {
+                $user_info = $this->format_user_info_for_ai($questionnaire_answers);
+                if (!empty($user_info)) {
+                    $prompt .= "\n\nДанные анкеты для персонализации:\n" . $user_info;
+                }
+            }
+        }
+        
+        return $prompt;
     }
     
     /**
@@ -4056,15 +4875,30 @@ class TCM_Telegram {
                 'Authorization' => 'Bearer ' . $api_key
             ),
             'body' => json_encode($request_body),
-            'timeout' => 30
+            'timeout' => 60
         ));
         
         if (is_wp_error($response)) {
             $error_message = $response->get_error_message();
+            $error_code = $response->get_error_code();
             error_log('TCM: DeepSeek API error: ' . $error_message);
             if ($log_enabled) {
                 error_log('TCM: Full error details: ' . print_r($response, true));
             }
+            
+            // Определяем тип ошибки для более понятного сообщения
+            $error_type = 'wp_error';
+            if (stripos($error_message, 'timeout') !== false || stripos($error_message, 'timed out') !== false || $error_code == 'http_request_failed') {
+                $error_type = 'timeout';
+            }
+            
+            // Сохраняем детали ошибки для отображения пользователю
+            $this->last_deepseek_error = array(
+                'code' => 0,
+                'message' => $error_message,
+                'type' => $error_type,
+                'error_code' => $error_code
+            );
             return false;
         }
         
@@ -4092,6 +4926,13 @@ class TCM_Telegram {
                     'message' => $error_message,
                     'type' => $error_type
                 );
+            } else {
+                // Ошибка без стандартной структуры DeepSeek
+                $this->last_deepseek_error = array(
+                    'code' => $response_code,
+                    'message' => mb_substr((string)$response_body, 0, 300),
+                    'type' => 'http_error'
+                );
             }
             return false;
         }
@@ -4106,7 +4947,22 @@ class TCM_Telegram {
             $content = $data['choices'][0]['message']['content'];
             if ($log_enabled) {
                 error_log('TCM: Successfully got content from DeepSeek. Length: ' . strlen($content));
+                error_log('TCM: Content preview: ' . mb_substr($content, 0, 200));
             }
+            
+            // Проверяем, что контент не пустой
+            if (empty(trim($content))) {
+                if ($log_enabled) {
+                    error_log('TCM: Content is empty after trimming');
+                }
+                $this->last_deepseek_error = array(
+                    'code' => $response_code,
+                    'message' => 'Ответ от DeepSeek API пустой',
+                    'type' => 'empty_response'
+                );
+                return false;
+            }
+            
             // Очищаем предыдущую ошибку при успехе
             $this->last_deepseek_error = null;
             
@@ -4140,7 +4996,130 @@ class TCM_Telegram {
             error_log('TCM: No content in response. Response structure: ' . print_r($data, true));
         }
         
+        // Сохраняем ошибку для отображения пользователю
+        $this->last_deepseek_error = array(
+            'code' => $response_code,
+            'message' => 'Неожиданная структура ответа от DeepSeek API. Ответ получен, но не содержит ожидаемых данных.',
+            'type' => 'unexpected_structure',
+            'response_preview' => mb_substr($response_body, 0, 200)
+        );
+        
         return false;
+    }
+    
+    /**
+     * Проверка соединения с DeepSeek API (для админки)
+     * 
+     * @return array Массив с результатом проверки: success (bool), message (string), details (array)
+     */
+    public function test_ai_connection() {
+        $api_key = get_option('tcm_deepseek_api_key', '');
+        $model = get_option('tcm_deepseek_model', 'deepseek-chat');
+        
+        if (empty($api_key)) {
+            return array(
+                'success' => false,
+                'message' => 'API ключ не указан',
+                'details' => array(
+                    'api_key_set' => false,
+                    'model' => $model
+                )
+            );
+        }
+        
+        // Отправляем простой тестовый запрос
+        $api_url = 'https://api.deepseek.com/chat/completions';
+        
+        $request_body = array(
+            'model' => $model,
+            'messages' => array(
+                array(
+                    'role' => 'user',
+                    'content' => 'Привет! Это тестовый запрос для проверки соединения. Ответь одним словом: "ОК".'
+                )
+            ),
+            'temperature' => 0.7,
+            'max_tokens' => 10,
+            'stream' => false
+        );
+        
+        $response = wp_remote_post($api_url, array(
+            'headers' => array(
+                'Content-Type' => 'application/json',
+                'Authorization' => 'Bearer ' . $api_key
+            ),
+            'body' => json_encode($request_body),
+            'timeout' => 15
+        ));
+        
+        if (is_wp_error($response)) {
+            return array(
+                'success' => false,
+                'message' => 'Ошибка соединения: ' . $response->get_error_message(),
+                'details' => array(
+                    'api_key_set' => true,
+                    'model' => $model,
+                    'error_type' => 'wp_error',
+                    'error_code' => $response->get_error_code()
+                )
+            );
+        }
+        
+        $response_code = wp_remote_retrieve_response_code($response);
+        $response_body = wp_remote_retrieve_body($response);
+        
+        if ($response_code !== 200) {
+            $data = json_decode($response_body, true);
+            $error_message = 'Неизвестная ошибка';
+            $error_type = 'http_error';
+            
+            if (isset($data['error'])) {
+                $error_message = isset($data['error']['message']) ? $data['error']['message'] : 'Unknown error';
+                $error_type = isset($data['error']['type']) ? $data['error']['type'] : 'unknown';
+            } else {
+                $error_message = mb_substr((string)$response_body, 0, 300);
+            }
+            
+            return array(
+                'success' => false,
+                'message' => 'Ошибка API: ' . $error_message,
+                'details' => array(
+                    'api_key_set' => true,
+                    'model' => $model,
+                    'response_code' => $response_code,
+                    'error_type' => $error_type,
+                    'error_message' => $error_message
+                )
+            );
+        }
+        
+        $data = json_decode($response_body, true);
+        
+        if (isset($data['choices'][0]['message']['content'])) {
+            $content = $data['choices'][0]['message']['content'];
+            return array(
+                'success' => true,
+                'message' => 'Соединение успешно установлено!',
+                'details' => array(
+                    'api_key_set' => true,
+                    'model' => $model,
+                    'response_code' => $response_code,
+                    'response_preview' => mb_substr($content, 0, 100),
+                    'tokens_used' => isset($data['usage']['total_tokens']) ? $data['usage']['total_tokens'] : 'N/A'
+                )
+            );
+        }
+        
+        return array(
+            'success' => false,
+            'message' => 'Неожиданный формат ответа от API',
+            'details' => array(
+                'api_key_set' => true,
+                'model' => $model,
+                'response_code' => $response_code,
+                'response_body' => mb_substr($response_body, 0, 500)
+            )
+        );
     }
     
     /**
@@ -4174,22 +5153,63 @@ class TCM_Telegram {
         $level_name_prepositional = $this->get_category_level_name($category_id, 'prepositional');
         $ai_response = $this->get_deepseek_assistance($category_id, $category->name, $level_name_prepositional, $wp_user_id);
         
-        if ($ai_response) {
-            $text = "🤖 <b>Помощь ИИ ассистента</b>\n\n";
-            $text .= "📂 <b>" . esc_html($category->name) . "</b>\n\n";
-            $text .= $ai_response;
+        if ($ai_response && !empty(trim($ai_response))) {
+            // Telegram имеет лимит 4096 символов на сообщение
+            $max_length = 4000; // Оставляем запас для заголовка и форматирования
+            $header = "🤖 <b>Помощь ИИ ассистента</b>\n\n📂 <b>" . esc_html($category->name) . "</b>\n\n";
+            $header_length = mb_strlen(strip_tags($header));
+            $available_length = $max_length - $header_length;
             
-            $keyboard = array(
-                array(
-                    array('text' => '🔄 Обновить ответ ИИ', 'callback_data' => 'ai_help_refresh:' . $category_id),
-                    array('text' => '🗑️ Очистить историю', 'callback_data' => 'ai_help_clear_history')
-                ),
-                array(
-                    array('text' => '⬅️ Назад', 'callback_data' => 'category:' . ($category->parent > 0 ? $category->parent : 0))
-                )
-            );
-            
-            $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
+            // Если ответ слишком длинный, разбиваем на части
+            if (mb_strlen($ai_response) > $available_length) {
+                // Отправляем первую часть с заголовком
+                $first_part = mb_substr($ai_response, 0, $available_length);
+                $text = $header . $first_part;
+                
+                $keyboard = array(
+                    array(
+                        array('text' => '🔄 Обновить ответ ИИ', 'callback_data' => 'ai_help_refresh:' . $category_id),
+                        array('text' => '🗑️ Очистить историю', 'callback_data' => 'ai_help_clear_history')
+                    ),
+                    array(
+                        array('text' => '⬅️ Назад', 'callback_data' => 'category:' . ($category->parent > 0 ? $category->parent : 0))
+                    )
+                );
+                
+                $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
+                
+                // Отправляем остальные части
+                $remaining = mb_substr($ai_response, $available_length);
+                $chunk_size = $max_length - 50; // Запас для нумерации
+                $part_num = 2;
+                
+                while (mb_strlen($remaining) > 0) {
+                    $chunk = mb_substr($remaining, 0, $chunk_size);
+                    $remaining = mb_substr($remaining, $chunk_size);
+                    
+                    $chunk_text = "📄 <b>Продолжение (часть " . $part_num . ")</b>\n\n" . $chunk;
+                    $this->send_reply($chat_id, $chunk_text);
+                    $part_num++;
+                    
+                    // Небольшая задержка между сообщениями
+                    usleep(300000); // 0.3 секунды
+                }
+            } else {
+                // Обычный случай - ответ помещается в одно сообщение
+                $text = $header . $ai_response;
+                
+                $keyboard = array(
+                    array(
+                        array('text' => '🔄 Обновить ответ ИИ', 'callback_data' => 'ai_help_refresh:' . $category_id),
+                        array('text' => '🗑️ Очистить историю', 'callback_data' => 'ai_help_clear_history')
+                    ),
+                    array(
+                        array('text' => '⬅️ Назад', 'callback_data' => 'category:' . ($category->parent > 0 ? $category->parent : 0))
+                    )
+                );
+                
+                $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
+            }
         } else {
             $api_key = get_option('tcm_deepseek_api_key', '');
             if (empty($api_key)) {
@@ -4198,7 +5218,7 @@ class TCM_Telegram {
                 // Проверяем детали последней ошибки
                 $error_msg = $this->get_deepseek_error_message();
                 if (!$error_msg) {
-                    $error_msg = '❌ Не удалось получить помощь от ИИ ассистента. Проверьте настройки API или попробуйте позже.';
+                    $error_msg = '❌ Не удалось получить помощь от ИИ ассистента. Возможно, произошла ошибка при обработке ответа от API. Попробуйте позже или обратитесь к администратору.';
                 }
             }
             $this->send_reply($chat_id, $error_msg);
@@ -4237,22 +5257,63 @@ class TCM_Telegram {
         $level_name_prepositional = $this->get_category_level_name($category_id, 'prepositional');
         $ai_response = $this->get_deepseek_assistance($category_id, $category->name, $level_name_prepositional, $wp_user_id);
         
-        if ($ai_response) {
-            $text = "🤖 <b>Помощь ИИ ассистента (обновлено)</b>\n\n";
-            $text .= "📂 <b>" . esc_html($category->name) . "</b>\n\n";
-            $text .= $ai_response;
+        if ($ai_response && !empty(trim($ai_response))) {
+            // Telegram имеет лимит 4096 символов на сообщение
+            $max_length = 4000; // Оставляем запас для заголовка и форматирования
+            $header = "🤖 <b>Помощь ИИ ассистента (обновлено)</b>\n\n📂 <b>" . esc_html($category->name) . "</b>\n\n";
+            $header_length = mb_strlen(strip_tags($header));
+            $available_length = $max_length - $header_length;
             
-            $keyboard = array(
-                array(
-                    array('text' => '🔄 Обновить ответ ИИ', 'callback_data' => 'ai_help_refresh:' . $category_id),
-                    array('text' => '🗑️ Очистить историю', 'callback_data' => 'ai_help_clear_history')
-                ),
-                array(
-                    array('text' => '⬅️ Назад', 'callback_data' => 'category:' . ($category->parent > 0 ? $category->parent : 0))
-                )
-            );
-            
-            $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
+            // Если ответ слишком длинный, разбиваем на части
+            if (mb_strlen($ai_response) > $available_length) {
+                // Отправляем первую часть с заголовком
+                $first_part = mb_substr($ai_response, 0, $available_length);
+                $text = $header . $first_part;
+                
+                $keyboard = array(
+                    array(
+                        array('text' => '🔄 Обновить ответ ИИ', 'callback_data' => 'ai_help_refresh:' . $category_id),
+                        array('text' => '🗑️ Очистить историю', 'callback_data' => 'ai_help_clear_history')
+                    ),
+                    array(
+                        array('text' => '⬅️ Назад', 'callback_data' => 'category:' . ($category->parent > 0 ? $category->parent : 0))
+                    )
+                );
+                
+                $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
+                
+                // Отправляем остальные части
+                $remaining = mb_substr($ai_response, $available_length);
+                $chunk_size = $max_length - 50; // Запас для нумерации
+                $part_num = 2;
+                
+                while (mb_strlen($remaining) > 0) {
+                    $chunk = mb_substr($remaining, 0, $chunk_size);
+                    $remaining = mb_substr($remaining, $chunk_size);
+                    
+                    $chunk_text = "📄 <b>Продолжение (часть " . $part_num . ")</b>\n\n" . $chunk;
+                    $this->send_reply($chat_id, $chunk_text);
+                    $part_num++;
+                    
+                    // Небольшая задержка между сообщениями
+                    usleep(300000); // 0.3 секунды
+                }
+            } else {
+                // Обычный случай - ответ помещается в одно сообщение
+                $text = $header . $ai_response;
+                
+                $keyboard = array(
+                    array(
+                        array('text' => '🔄 Обновить ответ ИИ', 'callback_data' => 'ai_help_refresh:' . $category_id),
+                        array('text' => '🗑️ Очистить историю', 'callback_data' => 'ai_help_clear_history')
+                    ),
+                    array(
+                        array('text' => '⬅️ Назад', 'callback_data' => 'category:' . ($category->parent > 0 ? $category->parent : 0))
+                    )
+                );
+                
+                $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
+            }
         } else {
             $api_key = get_option('tcm_deepseek_api_key', '');
             if (empty($api_key)) {
@@ -4261,7 +5322,7 @@ class TCM_Telegram {
                 // Проверяем детали последней ошибки
                 $error_msg = $this->get_deepseek_error_message();
                 if (!$error_msg) {
-                    $error_msg = '❌ Не удалось обновить помощь от ИИ ассистента. Проверьте настройки API или попробуйте позже.';
+                    $error_msg = '❌ Не удалось обновить помощь от ИИ ассистента. Возможно, произошла ошибка при обработке ответа от API. Попробуйте позже или обратитесь к администратору.';
                 }
             }
             $this->send_reply($chat_id, $error_msg);
@@ -4451,23 +5512,47 @@ class TCM_Telegram {
                 
                 if ($step_id) {
                     $step = get_category($step_id);
+                    $posts_count = $this->get_category_posts_count($step_id, $wp_user_id);
+                    $step_name = '📚 Текущий Шаг: ' . esc_html($step->name);
+                    if ($posts_count > 0) {
+                        $step_name .= ' (' . $posts_count . ')';
+                    }
                     $keyboard[] = array(
-                        array('text' => '📚 Текущий Шаг: ' . esc_html($step->name), 'callback_data' => 'view_current_step')
+                        array('text' => $step_name, 'callback_data' => 'view_current_step')
                     );
                 }
                 
                 if ($chapter_id) {
                     $chapter = get_category($chapter_id);
+                    $posts_count = $this->get_category_posts_count($chapter_id, $wp_user_id);
+                    $chapter_name = '📖 Текущая Глава: ' . esc_html($chapter->name);
+                    if ($posts_count > 0) {
+                        $chapter_name .= ' (' . $posts_count . ')';
+                    }
                     $keyboard[] = array(
-                        array('text' => '📖 Текущая Глава: ' . esc_html($chapter->name), 'callback_data' => 'view_current_chapter')
+                        array('text' => $chapter_name, 'callback_data' => 'view_current_chapter')
                     );
                 }
                 
                 if ($point_id) {
                     $point = get_category($point_id);
+                    $posts_count = $this->get_category_posts_count($point_id, $wp_user_id);
+                    $point_name = '📍 Текущая Точка: ' . esc_html($point->name);
+                    if ($posts_count > 0) {
+                        $point_name .= ' (' . $posts_count . ')';
+                    }
                     $keyboard[] = array(
-                        array('text' => '📍 Текущая Точка: ' . esc_html($point->name), 'callback_data' => 'view_current_point')
+                        array('text' => $point_name, 'callback_data' => 'view_current_point')
                     );
+                    
+                    // Проверяем, есть ли следующая точка
+                    $next_point = $this->get_next_point($point_id);
+                    if ($next_point) {
+                        $next_point_name_short = mb_strlen($next_point['name']) > 30 ? mb_substr($next_point['name'], 0, 27) . '...' : $next_point['name'];
+                        $keyboard[] = array(
+                            array('text' => '➡️ Перейти в следующую точку: ' . $next_point_name_short, 'callback_data' => 'go_to_next_point:' . $next_point['id'])
+                        );
+                    }
                 }
             }
         }
@@ -4573,10 +5658,23 @@ class TCM_Telegram {
         $keyboard = array(
             array(
                 array('text' => '✏️ Редактировать запись', 'callback_data' => 'edit_post:' . $post->ID)
-            ),
-            array(
-                array('text' => '🔙 Назад', 'callback_data' => 'view_posts:menu')
             )
+        );
+        
+        // Проверяем, есть ли следующая точка для категории записи
+        if (!empty($category) && isset($category[0])) {
+            $category_id = $category[0]->term_id;
+            $next_point = $this->get_next_point($category_id);
+            if ($next_point) {
+                $next_point_name_short = mb_strlen($next_point['name']) > 30 ? mb_substr($next_point['name'], 0, 27) . '...' : $next_point['name'];
+                $keyboard[] = array(
+                    array('text' => '➡️ Перейти в следующую точку: ' . $next_point_name_short, 'callback_data' => 'go_to_next_point:' . $next_point['id'])
+                );
+            }
+        }
+        
+        $keyboard[] = array(
+            array('text' => '🔙 Назад', 'callback_data' => 'view_posts:menu')
         );
         
         return $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
@@ -5427,8 +6525,14 @@ class TCM_Telegram {
         
         $keyboard = array();
         foreach ($chapters_with_posts as $chapter) {
+            // Получаем количество записей пользователя в этой Главе
+            $posts_count = $this->get_category_posts_count($chapter->term_id, $wp_user_id);
+            $chapter_name = esc_html($chapter->name);
+            if ($posts_count > 0) {
+                $chapter_name .= ' (' . $posts_count . ')';
+            }
             $keyboard[] = array(
-                array('text' => esc_html($chapter->name), 'callback_data' => 'custom_category:chapter_view:' . $chapter->term_id)
+                array('text' => $chapter_name, 'callback_data' => 'custom_category:chapter_view:' . $chapter->term_id)
             );
         }
         
@@ -5493,8 +6597,14 @@ class TCM_Telegram {
         
         $keyboard = array();
         foreach ($points_with_posts as $point) {
+            // Получаем количество записей пользователя в этой Точке
+            $posts_count = $this->get_category_posts_count($point->term_id, $wp_user_id);
+            $point_name = esc_html($point->name);
+            if ($posts_count > 0) {
+                $point_name .= ' (' . $posts_count . ')';
+            }
             $keyboard[] = array(
-                array('text' => esc_html($point->name), 'callback_data' => 'custom_category:point_view:' . $point->term_id)
+                array('text' => $point_name, 'callback_data' => 'custom_category:point_view:' . $point->term_id)
             );
         }
         
@@ -5502,7 +6612,12 @@ class TCM_Telegram {
             array('text' => '🔙 Назад', 'callback_data' => 'custom_category:step_view:' . ($step ? $step->term_id : 0))
         );
         
-        $text = "📖 <b>Глава: " . esc_html($chapter->name) . "</b>\n\n";
+        $posts_count = $this->get_category_posts_count($chapter_id, $wp_user_id);
+        $chapter_name = esc_html($chapter->name);
+        if ($posts_count > 0) {
+            $chapter_name .= ' (' . $posts_count . ')';
+        }
+        $text = "📖 <b>Глава: " . $chapter_name . "</b>\n\n";
         $text .= "Выберите Точку:";
         
         return $this->send_reply_with_keyboard($chat_id, $text, $keyboard);
