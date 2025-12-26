@@ -128,6 +128,22 @@
 									</p>
 									<?php
 									}
+									
+									// Проверяем, была ли запись создана из Telegram
+									if (class_exists('TCM_Telegram')) {
+										$telegram = new TCM_Telegram();
+										if ($telegram->is_post_from_telegram($post_id)) {
+											$telegram_created_at = get_post_meta($post_id, '_telegram_created_at', true);
+											?>
+											<p class="post-status published" style="color: #0088cc;">
+												<i class="fa fa-paper-plane"></i> Создано из Telegram
+												<?php if ($telegram_created_at): ?>
+													(<?php echo date('d.m.Y H:i', strtotime($telegram_created_at)); ?>)
+												<?php endif; ?>
+											</p>
+											<?php
+										}
+									}
 								?>
 								<p class="post-date">Дата публикации: <?php echo get_the_date('d.m.Y H:i'); ?></p>
 							</li>
@@ -160,6 +176,7 @@
 						
 						<label for="for-sponsor">Для Спонсора</label>
 						<input type="checkbox" name="for_sponsor" id="for-sponsor" value="1">
+						
 						
 						<input type="submit" value="Сохранить">
 					</div>
@@ -224,6 +241,41 @@
 					?>
 				</form>
 			</div>
+			
+			<script>
+			(function() {
+				var categoryId = <?php echo esc_js( $current_category->term_id ); ?>;
+				var storageKey = 'post_content_category_' + categoryId;
+				var textarea = document.getElementById('post-content');
+				var form = document.getElementById('post-form');
+				
+				if (textarea) {
+					// Восстанавливаем сохраненное содержимое при загрузке страницы
+					var savedContent = localStorage.getItem(storageKey);
+					if (savedContent) {
+						textarea.value = savedContent;
+					}
+					
+					// Сохраняем содержимое в localStorage при каждом изменении
+					textarea.addEventListener('input', function() {
+						localStorage.setItem(storageKey, textarea.value);
+					});
+					
+					// Очищаем localStorage после успешной отправки формы
+					form.addEventListener('submit', function() {
+						// Используем небольшую задержку, чтобы убедиться, что форма отправлена
+						setTimeout(function() {
+							localStorage.removeItem(storageKey);
+						}, 100);
+					});
+					
+					// Также сохраняем при уходе со страницы (beforeunload)
+					window.addEventListener('beforeunload', function() {
+						localStorage.setItem(storageKey, textarea.value);
+					});
+				}
+			})();
+			</script>
 			<?php
 				
 				// Display all posts in the current category visible to the current user
@@ -255,6 +307,22 @@
 								Для спонсора
 							</p>
 							<?php
+							}
+							
+							// Проверяем, была ли запись создана из Telegram
+							if (class_exists('TCM_Telegram')) {
+								$telegram = new TCM_Telegram();
+								if ($telegram->is_post_from_telegram($post_id)) {
+									$telegram_created_at = get_post_meta($post_id, '_telegram_created_at', true);
+									?>
+									<p class="post-status published" style="color: #0088cc;">
+										<i class="fa fa-paper-plane"></i> Создано из Telegram
+										<?php if ($telegram_created_at): ?>
+											(<?php echo date('d.m.Y H:i', strtotime($telegram_created_at)); ?>)
+										<?php endif; ?>
+									</p>
+									<?php
+								}
 							}
 						?>
 						<p class="post-date">Дата публикации: <?php echo get_the_date('d.m.Y H:i'); ?></p>
